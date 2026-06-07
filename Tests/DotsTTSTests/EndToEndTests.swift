@@ -49,6 +49,12 @@ final class EndToEndTests: XCTestCase {
         params.seed = UInt64(env["DOTS_SEED"].flatMap { UInt64($0) } ?? 1)
         params.maxOutputPatches = env["DOTS_MAX_PATCHES"].flatMap { Int($0) } ?? 200
 
+        // Bound MLX's buffer-recycle cache so this multi-chunk test can't hoard
+        // freed buffers up to physical RAM (the host app sets this via its own
+        // budget; a bare `swift test` has no such policy). Active allocations are
+        // never limited by this - only the idle free pool.
+        MLX.Memory.cacheLimit = 4 * 1024 * 1024 * 1024
+
         // Render sentence-by-sentence and join. A single-shot render of long
         // text makes one huge vocoder call (the latent->48kHz decode is the
         // memory hot spot), which can spike RAM into the tens of GB. Chunking
@@ -61,6 +67,9 @@ final class EndToEndTests: XCTestCase {
                 targetText: chunk, refAudio48k: refAudio,
                 refTranscript: meta.transcript, params: params).reshaped(-1)
             eval(piece)   // force this chunk's vocoder graph to run + free before the next
+            // Return this chunk's idle Metal buffers to the OS before the next
+            // chunk allocates, so peak memory tracks one chunk, not all of them.
+            MLX.GPU.clearCache()
             print("[e2e] chunk \(i + 1)/\(chunks.count) samples=\(piece.dim(0)): \(chunk)")
             if i > 0 { pieces.append(gap) }
             pieces.append(piece)
