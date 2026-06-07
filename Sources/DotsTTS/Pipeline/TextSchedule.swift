@@ -54,7 +54,20 @@ public enum DotsTemplate {
         special: DotsSpecialTokens
     ) -> [Int] {
         precondition(maxAudioTokens > 0, "maxAudioTokens must be positive")
-        let text = (promptText ?? "") + targetText
+        // Mirror runtime `_process_prompt_text` / `_process_text`: strip both, and
+        // for non-CJK prompts append a trailing space before concatenating with the
+        // target. Without the space the boundary (".The") tokenises differently from
+        // Python's ". The", shifting the whole prefill by a token and corrupting the
+        // KV cache, which degrades the cloned voice and runs generation long.
+        let prompt = (promptText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text: String
+        if prompt.isEmpty {
+            text = target
+        } else {
+            let separator = containsCJK(prompt) ? "" : " "
+            text = prompt + separator + target
+        }
         var ids: [Int] = []
         ids += tokenizer.encode(text: textPrefix, addSpecialTokens: false)
         ids += tokenizer.encode(text: text, addSpecialTokens: false)
@@ -62,5 +75,20 @@ public enum DotsTemplate {
         ids.append(special.audioGenStart)
         ids += Array(repeating: special.audioGenSpan, count: maxAudioTokens)
         return ids
+    }
+
+    /// True if the text contains CJK ideographs or Japanese kana. Used to match
+    /// the runtime's language rule for whether to insert a prompt/target space.
+    static func containsCJK(_ s: String) -> Bool {
+        for scalar in s.unicodeScalars {
+            let v = scalar.value
+            if (0x4E00...0x9FFF).contains(v)      // CJK Unified Ideographs
+                || (0x3400...0x4DBF).contains(v)  // CJK Ext A
+                || (0x3040...0x309F).contains(v)  // Hiragana
+                || (0x30A0...0x30FF).contains(v)  // Katakana
+                || (0xF900...0xFAFF).contains(v)  // CJK Compatibility Ideographs
+            { return true }
+        }
+        return false
     }
 }

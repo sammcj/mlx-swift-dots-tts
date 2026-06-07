@@ -39,6 +39,29 @@ public final class DotsTTSPipeline {
     let tokenizer: Tokenizer
     let special: DotsSpecialTokens
 
+    /// Debug-only: when set, decodeNextPatch uses these injected noises (indexed
+    /// by decode step) instead of MLXRandom.normal, and each solved patch latent
+    /// is recorded in `debugCapturedZ`. Lets the decode loop be replayed against
+    /// Python's trajectory with identical noise to localise feedback drift.
+    public var debugInjectNoise: [MLXArray]? = nil
+    public var debugCapturedZ: [MLXArray] = []
+    public var debugFirstInputSeq: MLXArray? = nil
+    public var debugFirstCfgSeq: MLXArray? = nil
+    public var debugFirstGCond: MLXArray? = nil
+    /// Debug-only: inject Python's exact stochastic conditioning to remove RNG
+    /// divergence (prompt-latent VAE sample, speaker random-crop) from decode
+    /// parity. debugInjectPromptLatents is the unnorm, last-patch-trimmed
+    /// reference latents (Python `prompt_latents_sampled`).
+    public var debugInjectPromptLatents: MLXArray? = nil
+    public var debugInjectGCond: MLXArray? = nil
+    public var debugCapturedEmbed: [MLXArray] = []
+    public var debugCapturedHidden: [MLXArray] = []
+    /// When set, replaces the patch-encoder embedding fed to the LLM decode step
+    /// with Python's exact embedding, isolating the LLM/cache path from the patch
+    /// encoder. The FM latent feedback still uses Swift's own z.
+    public var debugInjectEmbed: [MLXArray]? = nil
+    public var debugFullPrefillHidden: MLXArray? = nil
+
     // projection heads (raw weights; small, kept as arrays)
     let hiddenProjW, hiddenProjB: MLXArray
     let latentProjW, latentProjB: MLXArray
@@ -50,6 +73,8 @@ public final class DotsTTSPipeline {
     let patchSize = 4
     let hiddenPatchSize = 1
     let hopSize = 1920
+    let maxSpeakerSeconds = 10.0   // SpeakerXVectorFeatures.max_audio_seconds
+    let speakerSourceRate = 48000
 
     public init(modelRepo: URL, tokenizer: Tokenizer) throws {
         struct CfgFile: Codable { let quantization: QuantizationSettings.Config? }
@@ -140,9 +165,33 @@ public final class DotsTTSPipeline {
         return z.transposed(0, 2, 1)
     }
 
+    /// Test hook: g_cond from a raw 48k clip, padding exactly as generate() does.
+    public func debugSpeakerCond(refAudio48k: MLXArray, scale: Float = 1.5) -> MLXArray {
+        speakerCond(refAudio48k: padTo(refAudio48k, multiple: patchSize * hopSize), scale: scale)
+    }
+
+    /// Test hook: speaker sub-stages for localising glue bugs.
+    public func debugSpeakerStages(refAudio48k: MLXArray, scale: Float = 1.5) -> [String: MLXArray] {
+        var w = padTo(refAudio48k, multiple: patchSize * hopSize)
+        let maxSamples = Int((maxSpeakerSeconds * Double(speakerSourceRate)).rounded())
+        if w.dim(0) > maxSamples { w = w[0 ..< maxSamples] }
+        let mono16k = resampler(w)
+        let fb = fbank(mono16k)
+        let xvec = speaker(fb.expandedDimensions(axis: 0)).reshaped(1, 512) * scale
+        let g = xvecProj(xvec)
+        return ["resampled_16k": mono16k, "fbank": fb, "xvector_scaled": xvec, "g_cond": g]
+    }
+
     /// Speaker conditioning g_cond (1, 1024) from a 48 kHz mono reference clip.
+    /// The reference is cropped to `maxSpeakerSeconds` (the encoder's training
+    /// window; Python uses a random start, we use start 0 for determinism), then
+    /// resampled to 16 kHz, fbank'd, and run through CAM++ + xvec_proj.
     public func speakerCond(refAudio48k: MLXArray, scale: Float) -> MLXArray {
-        let mono16k = resampler(refAudio48k)
+        var w = refAudio48k
+        if w.ndim == 2 { w = w.reshaped(w.dim(w.ndim - 1)) }
+        let maxSamples = Int((maxSpeakerSeconds * Double(speakerSourceRate)).rounded())
+        if w.dim(0) > maxSamples { w = w[0 ..< maxSamples] }
+        let mono16k = resampler(w)
         let fb = fbank(mono16k).expandedDimensions(axis: 0)   // (1, T, 80)
         let xvec = speaker(fb).reshaped(1, 512) * scale       // (1, 512)
         return xvecProj(xvec)                                  // (1, 1024)
@@ -196,24 +245,43 @@ public final class DotsTTSPipeline {
         return additive.reshaped(1, 1, total, total)
     }
 
+    /// Test hook: run the loaded FM solver on EXTERNALLY supplied conditioning
+    /// (Python's real decode-step buffers) with an INJECTED fixed noise, so the
+    /// solver+DiT can be compared bit-for-bit against the torch reference with no
+    /// RNG divergence. `mask` is the additive (1,1,L,L) bias (0 keep / -inf drop).
+    public func debugSolveStep(inputSeq: MLXArray, cfgSeq: MLXArray, gCond: MLXArray,
+                               noise: MLXArray, mask: MLXArray, numSteps: Int, guidance: Float) -> MLXArray {
+        solver.solve(noise: noise, inputSeq: inputSeq, cfgSeq: cfgSeq, gCond: gCond,
+                     numSteps: numSteps, guidance: guidance, mask: mask)
+    }
+
     /// Solve one latent patch from the current FM history.
     private func decodeNextPatch(_ s: State, gCond: MLXArray, p: Params) -> MLXArray {
         let total = s.len + patchSize
         let pad = MLXArray.zeros([1, patchSize, 1024])
         let inputSeq = concatenated([s.cond!, pad], axis: 1)
         let cfgSeq = concatenated([s.uncond!, pad], axis: 1)
+        if debugInjectNoise != nil && debugCapturedZ.isEmpty && debugFirstInputSeq == nil {
+            debugFirstInputSeq = inputSeq
+            debugFirstCfgSeq = cfgSeq
+            debugFirstGCond = gCond
+        }
         let mask = fmMask(len: s.len, total: total, dtype: inputSeq.dtype)
-        let noise = MLXRandom.normal([1, patchSize, latentDim])
+        let noise: MLXArray
+        if let inj = debugInjectNoise {
+            noise = inj[min(debugCapturedZ.count, inj.count - 1)]
+        } else {
+            noise = MLXRandom.normal([1, patchSize, latentDim])
+        }
         return solver.solve(noise: noise, inputSeq: inputSeq, cfgSeq: cfgSeq, gCond: gCond,
                             numSteps: p.numSteps, guidance: p.guidance, mask: mask)
     }
 
-    /// EOS stop: softmax(eos_proj(hidden))[...,1] > threshold.
-    private func shouldStop(_ hidden: MLXArray, threshold: Float) -> Bool {
+    /// EOS stop probability: softmax(eos_proj(hidden))[...,1].
+    private func eosProb(_ hidden: MLXArray) -> Float {
         let h = silu(linear(hidden, eos0W, eos0B))
         let logits = linear(h, eos2W, eos2B)               // (1,1,2)
-        let prob = softmax(logits, axis: -1)[0, 0, 1]
-        return prob.item(Float.self) > threshold
+        return softmax(logits, axis: -1)[0, 0, 1].item(Float.self)
     }
 
     /// New LLM input embedding for the just-generated patch: re-run the patch
@@ -223,18 +291,66 @@ public final class DotsTTSPipeline {
         return emb[0..., (emb.dim(1) - 1) ..< emb.dim(1)]   // (1, 1, 1536)
     }
 
+    /// Test hook: run the prefill with EXTERNALLY supplied (unnorm, trimmed)
+    /// prompt latents so the glue is comparable to Python bit-for-bit (bypasses
+    /// the stochastic VAE sample). Returns promptEmbed (ppe), the FM cond/uncond
+    /// buffers after prefill, and the last prefill llm hidden.
+    public func debugPrefill(refLatentsTrim: MLXArray, targetText: String, refTranscript: String,
+                             maxOutputPatches: Int = 200) -> [String: MLXArray] {
+        let pc = refLatentsTrim.dim(1) / patchSize
+        let promptPatches = normalize(refLatentsTrim).reshaped(1, pc, patchSize, latentDim)
+        let maxAudio = pc + maxOutputPatches
+        let schedule = DotsTemplate.generationSchedule(
+            promptText: refTranscript, targetText: targetText, maxAudioTokens: maxAudio,
+            tokenizer: tokenizer, special: special)
+        let promptEmbed = patchEncoder(refLatentsTrim)
+        let spans = schedule.enumerated().filter { $0.element == special.audioGenSpan }.map { $0.offset }
+        let prefillEnd = spans[pc]
+        let s = State()
+        s.llmCache = backbone.makeCache()
+        s.unnormLatents = refLatentsTrim
+        let ids = MLXArray(schedule[0 ..< prefillEnd].map { Int32($0) }).reshaped(1, prefillEnd)
+        let tokEmbeds = backbone.embed(ids)
+        let p0 = spans[0]
+        let embeds = concatenated([tokEmbeds[0..., 0 ..< p0, 0...], promptEmbed], axis: 1)
+        let prefillHidden = backbone.step(embeds: embeds, cache: s.llmCache)
+        eval(prefillHidden)
+        var cursor = 0
+        for i in 0 ..< pc {
+            let sp = spans[i]
+            if sp > cursor { appendHidden(s, prefillHidden[0..., (sp - 1) ..< sp, 0...]) }
+            appendLatent(s, promptPatches[0..., i])
+            appendHidden(s, prefillHidden[0..., sp ..< (sp + 1), 0...])
+            cursor = sp + 1
+        }
+        return [
+            "prompt_patch_embeddings": promptEmbed,
+            "ppe_via_stages": patchEncoder.debugStages(refLatentsTrim)["final"]!,
+            "fm_sequence": s.cond!,
+            "fm_cfg_sequence": s.uncond!,
+            "llm_hidden_last": prefillHidden[0..., (prefillEnd - 1) ..< prefillEnd, 0...],
+        ]
+    }
+
     /// Generate a 48 kHz waveform (1, 1, samples). Voice cloning needs a
     /// reference clip + its transcript; targetText is what to speak.
     public func generate(targetText: String, refAudio48k: MLXArray, refTranscript: String, params: Params = Params()) -> MLXArray {
         MLXRandom.seed(params.seed)
-        let gCond = speakerCond(refAudio48k: refAudio48k, scale: params.speakerScale)
+        // Python pads the prompt audio before BOTH the speaker encoder and the VAE.
+        let pad = padTo(refAudio48k, multiple: patchSize * hopSize)
+        let gCond = debugInjectGCond ?? speakerCond(refAudio48k: pad, scale: params.speakerScale)
 
         // reference -> sampled latents (unnorm), trim last patch, normalised patches.
-        let pad = padTo(refAudio48k, multiple: patchSize * hopSize)
-        var refLatents = sampleFromLatent(audioVAE(pad))           // (1, L, 128) unnorm
-        refLatents = refLatents[0..., 0 ..< (refLatents.dim(1) - patchSize)]
-        let pc = refLatents.dim(1) / patchSize
-        let refLatentsTrim = refLatents[0..., 0 ..< (pc * patchSize)]
+        let refLatentsTrim: MLXArray
+        if let inj = debugInjectPromptLatents {
+            refLatentsTrim = inj
+        } else {
+            var refLatents = sampleFromLatent(audioVAE(pad))       // (1, L, 128) unnorm
+            refLatents = refLatents[0..., 0 ..< (refLatents.dim(1) - patchSize)]
+            let pcLocal = refLatents.dim(1) / patchSize
+            refLatentsTrim = refLatents[0..., 0 ..< (pcLocal * patchSize)]
+        }
+        let pc = refLatentsTrim.dim(1) / patchSize
         let promptPatches = normalize(refLatentsTrim).reshaped(1, pc, patchSize, latentDim)
 
         // schedule + prefill embeddings (patch encoder over the reference latents).
@@ -261,6 +377,7 @@ public final class DotsTTSPipeline {
         let embeds = concatenated([tokEmbeds[0..., 0 ..< p0, 0...], promptEmbed], axis: 1)
         let prefillHidden = backbone.step(embeds: embeds, cache: s.llmCache)  // (1, prefillEnd, 1536)
         eval(prefillHidden)
+        if debugInjectNoise != nil { debugFullPrefillHidden = prefillHidden }
         s.llmHidden = prefillHidden[0..., (prefillEnd - 1) ..< prefillEnd, 0...]
 
         // build FM history from the reference (mirrors _prefill).
@@ -277,16 +394,28 @@ public final class DotsTTSPipeline {
         var outPatches: [MLXArray] = []
         var dropFirst = true   // prompt prefill regenerates the prompt tail
         let totalSpans = spans.count
+        let debugEos = ProcessInfo.processInfo.environment["DOTS_DEBUG_EOS"] == "1"
         for step in 0 ..< (totalSpans - pc) {
-            let stop = shouldStop(s.llmHidden!, threshold: params.eosThreshold)
+            let prob = eosProb(s.llmHidden!)
+            let stop = prob > params.eosThreshold
             let z = decodeNextPatch(s, gCond: gCond, p: params)   // (1, patchSize, 128) normalised
             eval(z)
+            if debugInjectNoise != nil { debugCapturedZ.append(z) }
             // consume: append latent history (normalised), patch-encode, step LLM.
             appendLatent(s, z)
             let unnorm = denormalize(z)
+            if debugEos && (step % 5 == 0 || prob > 0.3) {
+                let rms = sqrt((unnorm * unnorm).mean()).item(Float.self)
+                print("[dec] patch \(step) eos=\(prob) latentRMS=\(rms)")
+            }
             appendUnnormLatent(s, unnorm)
-            let llmEmbed = patchEmbedding(s)
+            var llmEmbed = patchEmbedding(s)
+            if debugInjectNoise != nil { debugCapturedEmbed.append(llmEmbed) }
+            if let inj = debugInjectEmbed, debugCapturedHidden.count < inj.count {
+                llmEmbed = inj[debugCapturedHidden.count]
+            }
             s.llmHidden = backbone.step(embeds: llmEmbed, cache: s.llmCache)
+            if debugInjectNoise != nil { debugCapturedHidden.append(s.llmHidden!) }
             let isLast = (step == totalSpans - pc - 1)
             if !isLast { appendHidden(s, s.llmHidden!) }
             if dropFirst { dropFirst = false } else { outPatches.append(unnorm) }

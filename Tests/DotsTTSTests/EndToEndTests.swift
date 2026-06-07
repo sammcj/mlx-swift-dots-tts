@@ -27,7 +27,7 @@ final class EndToEndTests: XCTestCase {
         let pipeline = try DotsTTSPipeline(modelRepo: URL(fileURLWithPath: repo), tokenizer: tokenizer)
 
         var params = DotsTTSPipeline.Params()
-        params.seed = 1
+        params.seed = UInt64(env["DOTS_SEED"].flatMap { UInt64($0) } ?? 1)
         params.maxOutputPatches = 200
         let wav = pipeline.generate(
             targetText: meta.target_text, refAudio48k: refAudio,

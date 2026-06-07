@@ -62,6 +62,16 @@ public final class PatchEncoder: Module {
         return projectEmbeddings(h)         // (B, L/4, 1536)
     }
 
+    /// Test hook: per-stage outputs for localising parity bugs.
+    public func debugStages(_ x: MLXArray) -> [String: MLXArray] {
+        let pd = padded(x, widths: [.init((0, 0)), .init((1, 0)), .init((0, 0))])
+        let ds = dsProj(pd)
+        let inp = inProj(ds)
+        let enc = encoder(inp)
+        let final = projectEmbeddings(enc)
+        return ["after_downsample": ds, "after_in_proj": inp, "after_encoder": enc, "final": final]
+    }
+
     /// group every `outDsRate` consecutive tokens along the feature dim then project.
     /// rearrange "b (s d) h -> b s (d h)" with d=2: token[2s] feats then token[2s+1].
     private func projectEmbeddings(_ z: MLXArray) -> MLXArray {
