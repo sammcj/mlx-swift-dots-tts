@@ -30,14 +30,14 @@ public final class DiT: Module {
     @ModuleInfo(key: "blocks") var blocks: [DiTBlock]
     @ModuleInfo(key: "output_layer") var outputLayer: FinalLayer
 
-    public init(_ cfg: Config = Config()) {
-        self._inputLayer.wrappedValue = Linear(cfg.inDim, cfg.hidden, bias: true)
-        self._timeEmbedder.wrappedValue = TimestepEmbedder(hidden: cfg.hidden)
+    public init(_ cfg: Config = Config(), quant: QuantizationSettings = .none) {
+        self._inputLayer.wrappedValue = QuantizedLayerFactory.linear(cfg.inDim, cfg.hidden, bias: true, settings: quant)
+        self._timeEmbedder.wrappedValue = TimestepEmbedder(hidden: cfg.hidden, quant: quant)
         self._blocks.wrappedValue = (0..<cfg.numLayers).map { _ in
             DiTBlock(hidden: cfg.hidden, numHeads: cfg.numHeads, ffn: cfg.ffn,
-                     theta: cfg.theta, rmsEps: cfg.rmsEps, lnEps: cfg.lnEps)
+                     theta: cfg.theta, rmsEps: cfg.rmsEps, lnEps: cfg.lnEps, quant: quant)
         }
-        self._outputLayer.wrappedValue = FinalLayer(hidden: cfg.hidden, outDim: cfg.outDim, lnEps: cfg.lnEps)
+        self._outputLayer.wrappedValue = FinalLayer(hidden: cfg.hidden, outDim: cfg.outDim, lnEps: cfg.lnEps, quant: quant)
         super.init()
     }
 
@@ -68,9 +68,13 @@ public final class TimestepEmbedder: Module {
     @ModuleInfo(key: "mlp") var mlp: [UnaryLayer]  // [Linear, SiLU, Linear]
     let freqSize: Int
 
-    public init(hidden: Int, freqSize: Int = 256) {
+    public init(hidden: Int, freqSize: Int = 256, quant: QuantizationSettings = .none) {
         self.freqSize = freqSize
-        self._mlp.wrappedValue = [Linear(freqSize, hidden), SiLU(), Linear(hidden, hidden)]
+        self._mlp.wrappedValue = [
+            QuantizedLayerFactory.linear(freqSize, hidden, settings: quant),
+            SiLU(),
+            QuantizedLayerFactory.linear(hidden, hidden, settings: quant),
+        ]
         super.init()
     }
 
@@ -103,16 +107,16 @@ public final class DiTAttention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     let rope: RoPE
 
-    public init(hidden: Int, numHeads: Int, theta: Float, rmsEps: Float) {
+    public init(hidden: Int, numHeads: Int, theta: Float, rmsEps: Float, quant: QuantizationSettings = .none) {
         self.numHeads = numHeads
         self.headDim = hidden / numHeads
         self.scale = Foundation.pow(Double(headDim), -0.5).floatValue
-        self._qProj.wrappedValue = Linear(hidden, hidden, bias: false)
-        self._kProj.wrappedValue = Linear(hidden, hidden, bias: false)
-        self._vProj.wrappedValue = Linear(hidden, hidden, bias: false)
+        self._qProj.wrappedValue = QuantizedLayerFactory.linear(hidden, hidden, bias: false, settings: quant)
+        self._kProj.wrappedValue = QuantizedLayerFactory.linear(hidden, hidden, bias: false, settings: quant)
+        self._vProj.wrappedValue = QuantizedLayerFactory.linear(hidden, hidden, bias: false, settings: quant)
         self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: rmsEps)
         self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: rmsEps)
-        self._oProj.wrappedValue = Linear(hidden, hidden, bias: true)
+        self._oProj.wrappedValue = QuantizedLayerFactory.linear(hidden, hidden, bias: true, settings: quant)
         self.rope = RoPE(dimensions: headDim, traditional: false, base: theta)
         super.init()
     }
@@ -135,9 +139,9 @@ public final class DiTMlp: Module {
     @ModuleInfo(key: "fc1") var fc1: Linear
     @ModuleInfo(key: "fc2") var fc2: Linear
 
-    public init(hidden: Int, ffn: Int) {
-        self._fc1.wrappedValue = Linear(hidden, ffn, bias: true)
-        self._fc2.wrappedValue = Linear(ffn, hidden, bias: true)
+    public init(hidden: Int, ffn: Int, quant: QuantizationSettings = .none) {
+        self._fc1.wrappedValue = QuantizedLayerFactory.linear(hidden, ffn, bias: true, settings: quant)
+        self._fc2.wrappedValue = QuantizedLayerFactory.linear(ffn, hidden, bias: true, settings: quant)
         super.init()
     }
 
@@ -153,12 +157,12 @@ public final class DiTBlock: Module {
     @ModuleInfo(key: "ffn") var ffn: DiTMlp
     @ModuleInfo(key: "adaLN_modulation") var adaLN: [UnaryLayer]  // [SiLU, Linear]
 
-    public init(hidden: Int, numHeads: Int, ffn: Int, theta: Float, rmsEps: Float, lnEps: Float) {
+    public init(hidden: Int, numHeads: Int, ffn: Int, theta: Float, rmsEps: Float, lnEps: Float, quant: QuantizationSettings = .none) {
         self._norm1.wrappedValue = LayerNorm(dimensions: hidden, eps: lnEps, affine: false)
         self._norm2.wrappedValue = LayerNorm(dimensions: hidden, eps: lnEps, affine: false)
-        self._attn.wrappedValue = DiTAttention(hidden: hidden, numHeads: numHeads, theta: theta, rmsEps: rmsEps)
-        self._ffn.wrappedValue = DiTMlp(hidden: hidden, ffn: ffn)
-        self._adaLN.wrappedValue = [SiLU(), Linear(hidden, 6 * hidden)]
+        self._attn.wrappedValue = DiTAttention(hidden: hidden, numHeads: numHeads, theta: theta, rmsEps: rmsEps, quant: quant)
+        self._ffn.wrappedValue = DiTMlp(hidden: hidden, ffn: ffn, quant: quant)
+        self._adaLN.wrappedValue = [SiLU(), QuantizedLayerFactory.linear(hidden, 6 * hidden, settings: quant)]
         super.init()
     }
 
@@ -176,10 +180,10 @@ public final class FinalLayer: Module {
     @ModuleInfo(key: "linear") var linear: Linear
     @ModuleInfo(key: "adaLN_modulation") var adaLN: [UnaryLayer]  // [SiLU, Linear]
 
-    public init(hidden: Int, outDim: Int, lnEps: Float) {
+    public init(hidden: Int, outDim: Int, lnEps: Float, quant: QuantizationSettings = .none) {
         self._norm.wrappedValue = LayerNorm(dimensions: hidden, eps: lnEps, affine: false)
-        self._linear.wrappedValue = Linear(hidden, outDim, bias: true)
-        self._adaLN.wrappedValue = [SiLU(), Linear(hidden, 2 * hidden)]
+        self._linear.wrappedValue = QuantizedLayerFactory.linear(hidden, outDim, bias: true, settings: quant)
+        self._adaLN.wrappedValue = [SiLU(), QuantizedLayerFactory.linear(hidden, 2 * hidden, settings: quant)]
         super.init()
     }
 

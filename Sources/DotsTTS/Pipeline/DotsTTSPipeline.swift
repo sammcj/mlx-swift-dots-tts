@@ -16,7 +16,12 @@ import Tokenizers
 /// BigVGAN/AudioVAE decoder renders 48 kHz audio.
 ///
 /// See the verified algorithm notes for the FM buffer layout and CFG asymmetry.
-public final class DotsTTSPipeline {
+///
+/// `@unchecked Sendable`: the pipeline holds MLX model state and mutable debug
+/// hooks, but it is meant to be owned by a single serialising actor (Cloney's
+/// `DotsSwiftSynthesiser`), which never calls it concurrently. The debug-inject
+/// properties are test-only and unused on the actor path.
+public final class DotsTTSPipeline: @unchecked Sendable {
     public struct Params: Sendable {
         public var numSteps = 10
         public var guidance: Float = 1.2          // runtime default (NOT core.py's 3.0)
@@ -78,16 +83,28 @@ public final class DotsTTSPipeline {
 
     public init(modelRepo: URL, tokenizer: Tokenizer) throws {
         struct CfgFile: Codable { let quantization: QuantizationSettings.Config? }
+        // Per-component quantisation: read the component's config.json `quantization`
+        // block (mlx_lm format). Absent block -> fp32. Lets backbone / DiT /
+        // patch_encoder each ship at their own precision in a given model repo.
+        func quantOf(_ dir: URL) -> QuantizationSettings {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("config.json")),
+                  let cfg = try? JSONDecoder().decode(CfgFile.self, from: data) else { return .none }
+            return QuantizationSettings(from: cfg.quantization)
+        }
+
         let backboneDir = modelRepo.appendingPathComponent("backbone")
-        let q = QuantizationSettings(from: try JSONDecoder().decode(
-            CfgFile.self, from: Data(contentsOf: backboneDir.appendingPathComponent("config.json"))).quantization)
+        let q = quantOf(backboneDir)
         let bb = Qwen2Backbone()
         if q.enabled { quantize(model: bb, groupSize: q.groupSize, bits: q.bits) }
         try WeightLoading.load(bb, from: backboneDir)
         self.backbone = bb
 
-        let dit = DiT()
-        try WeightLoading.load(dit, from: modelRepo.appendingPathComponent("dit"))
+        let ditDir = modelRepo.appendingPathComponent("dit")
+        // DiT nests Linears inside [UnaryLayer] arrays (adaLN_modulation,
+        // time_embedder.mlp) that quantize(model:) cannot reach, so build them
+        // quantised at construction via the factory instead.
+        let dit = DiT(quant: quantOf(ditDir))
+        try WeightLoading.load(dit, from: ditDir)
         self.dit = dit
         self.solver = EulerSolver(dit: dit)
 
@@ -104,8 +121,9 @@ public final class DotsTTSPipeline {
         try WeightLoading.load(vae, from: modelRepo.appendingPathComponent("audiovae_encoder"))
         self.audioVAE = vae
 
-        let pe = PatchEncoder()
-        try WeightLoading.load(pe, from: modelRepo.appendingPathComponent("patch_encoder"))
+        let peDir = modelRepo.appendingPathComponent("patch_encoder")
+        let pe = PatchEncoder(quant: quantOf(peDir))
+        try WeightLoading.load(pe, from: peDir)
         self.patchEncoder = pe
 
         let heads = try MLX.loadArrays(url: modelRepo.appendingPathComponent("heads/model.safetensors"))

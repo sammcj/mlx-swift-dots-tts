@@ -11,15 +11,34 @@ import XCTest
 final class EndToEndTests: XCTestCase {
     struct Meta: Codable { let transcript: String; let target_text: String; let sample_rate: Int }
 
+    /// Split target text into sentence-ish chunks so each render (and its
+    /// vocoder decode) stays small. Splits after . ! ? keeping the punctuation.
+    static func splitIntoChunks(_ text: String) -> [String] {
+        var chunks: [String] = []
+        var current = ""
+        for ch in text {
+            current.append(ch)
+            if ch == "." || ch == "!" || ch == "?" {
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { chunks.append(trimmed) }
+                current = ""
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { chunks.append(tail) }
+        return chunks.isEmpty ? [text] : chunks
+    }
+
     func testRenderProducesAudio() async throws {
         let env = ProcessInfo.processInfo.environment
         try XCTSkipUnless(env["DOTS_RUN_E2E"] == "1", "set DOTS_RUN_E2E=1 to run the slow e2e render")
         let repo = env["DOTS_MODEL_REPO"] ?? "/Users/samm/git/sammcj/dots.tts-soar-mlx"
         let fixtures = env["DOTS_FIXTURES"] ?? "/Users/samm/git/dots-mlx-spike"
         let outPath = env["DOTS_E2E_OUT"] ?? "\(fixtures)/dots_mlx_out.safetensors"
+        let fixtureName = env["DOTS_FIXTURE"] ?? "e2e_fixture"
 
-        let fixURL = URL(fileURLWithPath: fixtures).appendingPathComponent("e2e_fixture.safetensors")
-        let metaURL = URL(fileURLWithPath: fixtures).appendingPathComponent("e2e_fixture.json")
+        let fixURL = URL(fileURLWithPath: fixtures).appendingPathComponent("\(fixtureName).safetensors")
+        let metaURL = URL(fileURLWithPath: fixtures).appendingPathComponent("\(fixtureName).json")
         let meta = try JSONDecoder().decode(Meta.self, from: Data(contentsOf: metaURL))
         let refAudio = try MLX.loadArrays(url: fixURL)["ref_audio_48k"]!.asType(.float32)
 
@@ -28,12 +47,26 @@ final class EndToEndTests: XCTestCase {
 
         var params = DotsTTSPipeline.Params()
         params.seed = UInt64(env["DOTS_SEED"].flatMap { UInt64($0) } ?? 1)
-        params.maxOutputPatches = 200
-        let wav = pipeline.generate(
-            targetText: meta.target_text, refAudio48k: refAudio,
-            refTranscript: meta.transcript, params: params)
-        eval(wav)
-        let samples = wav.reshaped(-1)
+        params.maxOutputPatches = env["DOTS_MAX_PATCHES"].flatMap { Int($0) } ?? 200
+
+        // Render sentence-by-sentence and join. A single-shot render of long
+        // text makes one huge vocoder call (the latent->48kHz decode is the
+        // memory hot spot), which can spike RAM into the tens of GB. Chunking
+        // bounds each vocoder call and mirrors how the app renders long text.
+        let chunks = Self.splitIntoChunks(meta.target_text)
+        let gap = MLXArray.zeros([Int(Double(meta.sample_rate) * 0.12)], dtype: .float32)
+        var pieces: [MLXArray] = []
+        for (i, chunk) in chunks.enumerated() {
+            let piece = pipeline.generate(
+                targetText: chunk, refAudio48k: refAudio,
+                refTranscript: meta.transcript, params: params).reshaped(-1)
+            eval(piece)   // force this chunk's vocoder graph to run + free before the next
+            print("[e2e] chunk \(i + 1)/\(chunks.count) samples=\(piece.dim(0)): \(chunk)")
+            if i > 0 { pieces.append(gap) }
+            pieces.append(piece)
+        }
+        let samples = concatenated(pieces, axis: 0)
+        eval(samples)
         print("[e2e] output samples = \(samples.dim(0)) (\(Double(samples.dim(0)) / Double(meta.sample_rate))s)")
         XCTAssertGreaterThan(samples.dim(0), meta.sample_rate / 2, "render shorter than 0.5s")
         let peak = abs(samples).max().item(Float.self)

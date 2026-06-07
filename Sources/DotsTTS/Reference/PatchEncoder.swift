@@ -39,15 +39,16 @@ public final class PatchEncoder: Module {
     @ModuleInfo(key: "encoder") var encoder: TransformerStack
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
-    public init(_ cfg: Config = Config()) {
+    public init(_ cfg: Config = Config(), quant: QuantizationSettings = .none) {
         self.cfg = cfg
         // Conv1d(channels-last). padding=0; we left-pad manually for causality.
+        // Conv weight is 3D, left fp by the quantiser.
         self._dsProj.wrappedValue = Conv1d(
             inputChannels: cfg.inDim, outputChannels: cfg.inDim,
             kernelSize: 2, stride: 2, padding: 0, bias: true)
-        self._inProj.wrappedValue = Linear(cfg.inDim, cfg.hidden, bias: true)
-        self._encoder.wrappedValue = TransformerStack(cfg)
-        self._outProj.wrappedValue = Linear(cfg.hidden * cfg.outDsRate, cfg.outDim, bias: true)
+        self._inProj.wrappedValue = QuantizedLayerFactory.linear(cfg.inDim, cfg.hidden, bias: true, settings: quant)
+        self._encoder.wrappedValue = TransformerStack(cfg, quant: quant)
+        self._outProj.wrappedValue = QuantizedLayerFactory.linear(cfg.hidden * cfg.outDsRate, cfg.outDim, bias: true, settings: quant)
         super.init()
     }
 
@@ -86,9 +87,9 @@ public final class PatchEncoder: Module {
 public final class TransformerStack: Module {
     @ModuleInfo(key: "layers") var layers: [TransformerEncoderLayer]
 
-    public init(_ cfg: PatchEncoder.Config) {
+    public init(_ cfg: PatchEncoder.Config, quant: QuantizationSettings = .none) {
         self._layers.wrappedValue = (0..<cfg.numLayers).map { _ in
-            TransformerEncoderLayer(cfg)
+            TransformerEncoderLayer(cfg, quant: quant)
         }
         super.init()
     }
@@ -111,11 +112,11 @@ public final class TransformerEncoderLayer: Module {
     @ModuleInfo(key: "ffn_norm") var ffnNorm: RMSNorm
     @ModuleInfo(key: "ffn") var ffn: SemanticMlp
 
-    public init(_ cfg: PatchEncoder.Config) {
+    public init(_ cfg: PatchEncoder.Config, quant: QuantizationSettings = .none) {
         self._attnNorm.wrappedValue = RMSNorm(dimensions: cfg.hidden, eps: cfg.rmsEps)
-        self._attn.wrappedValue = MultiHeadSelfAttention(cfg)
+        self._attn.wrappedValue = MultiHeadSelfAttention(cfg, quant: quant)
         self._ffnNorm.wrappedValue = RMSNorm(dimensions: cfg.hidden, eps: cfg.rmsEps)
-        self._ffn.wrappedValue = SemanticMlp(hidden: cfg.hidden, ffn: cfg.ffn)
+        self._ffn.wrappedValue = SemanticMlp(hidden: cfg.hidden, ffn: cfg.ffn, quant: quant)
         super.init()
     }
 
@@ -140,14 +141,14 @@ public final class MultiHeadSelfAttention: Module {
     @ModuleInfo(key: "v_proj") var vProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
-    public init(_ cfg: PatchEncoder.Config) {
+    public init(_ cfg: PatchEncoder.Config, quant: QuantizationSettings = .none) {
         self.numHeads = cfg.numHeads
         self.headDim = cfg.hidden / cfg.numHeads
         self.scale = Foundation.pow(Double(headDim), -0.5).floatValue
-        self._qProj.wrappedValue = Linear(cfg.hidden, cfg.hidden, bias: false)
-        self._kProj.wrappedValue = Linear(cfg.hidden, cfg.hidden, bias: false)
-        self._vProj.wrappedValue = Linear(cfg.hidden, cfg.hidden, bias: false)
-        self._oProj.wrappedValue = Linear(cfg.hidden, cfg.hidden, bias: true)
+        self._qProj.wrappedValue = QuantizedLayerFactory.linear(cfg.hidden, cfg.hidden, bias: false, settings: quant)
+        self._kProj.wrappedValue = QuantizedLayerFactory.linear(cfg.hidden, cfg.hidden, bias: false, settings: quant)
+        self._vProj.wrappedValue = QuantizedLayerFactory.linear(cfg.hidden, cfg.hidden, bias: false, settings: quant)
+        self._oProj.wrappedValue = QuantizedLayerFactory.linear(cfg.hidden, cfg.hidden, bias: true, settings: quant)
         super.init()
     }
 
@@ -177,9 +178,9 @@ public final class SemanticMlp: Module {
     @ModuleInfo(key: "fc1") var fc1: Linear
     @ModuleInfo(key: "fc2") var fc2: Linear
 
-    public init(hidden: Int, ffn: Int) {
-        self._fc1.wrappedValue = Linear(hidden, ffn, bias: true)
-        self._fc2.wrappedValue = Linear(ffn, hidden, bias: true)
+    public init(hidden: Int, ffn: Int, quant: QuantizationSettings = .none) {
+        self._fc1.wrappedValue = QuantizedLayerFactory.linear(hidden, ffn, bias: true, settings: quant)
+        self._fc2.wrappedValue = QuantizedLayerFactory.linear(ffn, hidden, bias: true, settings: quant)
         super.init()
     }
 
