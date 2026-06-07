@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj
+Package.resolved
+.netrc
+# local model weights / scratch
+*.safetensors
+*.npz
