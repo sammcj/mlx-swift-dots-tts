@@ -55,6 +55,8 @@ public final class DotsTTSPipeline: @unchecked Sendable {
         public var numSteps = 10
         public var guidance: Float = 1.2          // runtime default (NOT core.py's 3.0)
         public var speakerScale: Float = 1.5
+        /// Fixed-step ODE solver for the flow-matching path. Ignored by MeanFlow.
+        public var odeMethod: ODEMethod = .euler
         public var eosThreshold: Float = 0.8
         public var maxOutputPatches = 600
         public var seed: UInt64 = 0
@@ -368,7 +370,8 @@ public final class DotsTTSPipeline: @unchecked Sendable {
                                         nfe: p.numSteps, mask: mask)
         }
         return solver.solve(noise: noise, inputSeq: inputSeq, cfgSeq: cfgSeq, gCond: gCond,
-                            numSteps: p.numSteps, guidance: p.guidance, mask: mask)
+                            numSteps: p.numSteps, guidance: p.guidance, method: p.odeMethod,
+                            mask: mask)
     }
 
     /// EOS stop probability: softmax(eos_proj(hidden))[...,1].

@@ -2,6 +2,22 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Fixed-step integrator for the flow-matching ODE. Higher orders trade model
+/// evaluations per step for per-step accuracy: Euler does 1 velocity eval,
+/// midpoint (RK2) 2, RK4 4. MeanFlow ignores this entirely (`solveMeanFlow`
+/// has its own distilled integrator).
+public enum ODEMethod: String, Sendable, CaseIterable {
+    case euler
+    case midpoint
+    case rk4
+
+    /// Lenient parse: unknown strings fall back to Euler so a stale param can't
+    /// pick a non-existent solver.
+    public init(_ raw: String) {
+        self = ODEMethod(rawValue: raw.lowercased()) ?? .euler
+    }
+}
+
 /// Flow-matching Euler solver with classifier-free guidance.
 ///
 /// Swift port of core.py `_flow_matching_step_fm` / `fm_solver_step`. The DiT
@@ -59,20 +75,46 @@ public final class EulerSolver: Module {
 
     /// Integrate the FM ODE from noise to a clean latent.
     /// - noise:    (1, patchSize, latentDim) initial sample
+    /// - method:   integration scheme. Euler is 1 DiT eval/step; midpoint 2; RK4 4.
+    ///   At a fixed `numSteps`, a higher order is more accurate but costs that many
+    ///   more model evaluations (each is itself a 2-batch CFG forward).
     /// Returns the integrated latent (1, patchSize, latentDim).
     /// - mask: optional additive attention bias (0 keep / -inf drop) broadcastable
     ///   to (2, numHeads, L, L). When nil the DiT uses full attention. The mask is
-    ///   constant across Euler steps, so the caller builds it once.
+    ///   constant across steps, so the caller builds it once.
     public func solve(
         noise: MLXArray, inputSeq: MLXArray, cfgSeq: MLXArray, gCond: MLXArray,
-        numSteps: Int = 10, guidance: Float = 3.0, mask: MLXArray? = nil
+        numSteps: Int = 10, guidance: Float = 3.0, method: ODEMethod = .euler,
+        mask: MLXArray? = nil
     ) -> MLXArray {
         guidanceScale = guidance
         var z = noise
         let dt = 1.0 / Float(numSteps)
+
+        // Guided velocity at (z, t). One call = one 2-batch DiT forward.
+        func f(_ t: Float, _ zz: MLXArray) -> MLXArray {
+            solverStep(
+                t: MLXArray(t), z: zz, inputSeq: inputSeq, cfgSeq: cfgSeq,
+                gCond: gCond, mask: mask)
+        }
+
         for n in 0 ..< numSteps {
-            let t = MLXArray(Float(n) * dt)
-            z = z + dt * solverStep(t: t, z: z, inputSeq: inputSeq, cfgSeq: cfgSeq, gCond: gCond, mask: mask)
+            let t = Float(n) * dt
+            let slope: MLXArray
+            switch method {
+            case .euler:
+                slope = f(t, z)
+            case .midpoint:
+                let k1 = f(t, z)
+                slope = f(t + dt / 2, z + (dt / 2) * k1)
+            case .rk4:
+                let k1 = f(t, z)
+                let k2 = f(t + dt / 2, z + (dt / 2) * k1)
+                let k3 = f(t + dt / 2, z + (dt / 2) * k2)
+                let k4 = f(t + dt, z + dt * k3)
+                slope = (k1 + 2 * k2 + 2 * k3 + k4) / 6
+            }
+            z = z + dt * slope
             eval(z)
         }
         return z

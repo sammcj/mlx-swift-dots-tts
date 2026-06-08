@@ -52,6 +52,7 @@ final class EndToEndTests: XCTestCase {
         // flow-matching it's the Euler step count.
         if let n = env["DOTS_NUM_STEPS"].flatMap({ Int($0) }) { params.numSteps = n }
         if let g = env["DOTS_GUIDANCE"].flatMap({ Float($0) }) { params.guidance = g }
+        if let m = env["DOTS_ODE_METHOD"] { params.odeMethod = ODEMethod(m) }
 
         // Bound MLX's buffer-recycle cache so this multi-chunk test can't hoard
         // freed buffers up to physical RAM (the host app sets this via its own
