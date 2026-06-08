@@ -22,17 +22,25 @@ public final class DiT: Module {
         public var theta: Float = 10000
         public var rmsEps: Float = 1.1920929e-7  // torch finfo(f32).eps
         public var lnEps: Float = 1e-5
+        /// MeanFlow-distilled checkpoint: adds a `duration_embedder` (a second
+        /// TimestepEmbedder) whose embedding of the step interval dt is added into
+        /// the conditioning vector c. Flow-matching checkpoints leave this off.
+        public var meanflow = false
         public init() {}
     }
 
     @ModuleInfo(key: "input_layer") var inputLayer: Linear
     @ModuleInfo(key: "time_embedder") var timeEmbedder: TimestepEmbedder
+    @ModuleInfo(key: "duration_embedder") var durationEmbedder: TimestepEmbedder?
     @ModuleInfo(key: "blocks") var blocks: [DiTBlock]
     @ModuleInfo(key: "output_layer") var outputLayer: FinalLayer
 
     public init(_ cfg: Config = Config(), quant: QuantizationSettings = .none) {
         self._inputLayer.wrappedValue = QuantizedLayerFactory.linear(cfg.inDim, cfg.hidden, bias: true, settings: quant)
         self._timeEmbedder.wrappedValue = TimestepEmbedder(hidden: cfg.hidden, quant: quant)
+        // Built only for MeanFlow; nil otherwise so no `duration_embedder.*` weight
+        // keys are expected when loading a flow-matching checkpoint.
+        self._durationEmbedder.wrappedValue = cfg.meanflow ? TimestepEmbedder(hidden: cfg.hidden, quant: quant) : nil
         self._blocks.wrappedValue = (0..<cfg.numLayers).map { _ in
             DiTBlock(hidden: cfg.hidden, numHeads: cfg.numHeads, ffn: cfg.ffn,
                      theta: cfg.theta, rmsEps: cfg.rmsEps, lnEps: cfg.lnEps, quant: quant)
@@ -43,9 +51,12 @@ public final class DiT: Module {
 
     /// x: (B, L, inDim); timesteps: (B,); gCond: (B, hidden); mask: optional additive
     /// attention bias broadcastable to (B, numHeads, L, L) (0 keep / -inf drop).
+    /// `duration` (B,) is the MeanFlow step interval dt; ignored unless this DiT
+    /// was built with `meanflow` (mirrors dit.py: c = t_embed + dur_embed + g).
     /// Returns (B, L, outDim).
-    public func callAsFunction(_ x: MLXArray, timesteps: MLXArray, gCond: MLXArray?, mask: MLXArray? = nil) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, timesteps: MLXArray, gCond: MLXArray?, mask: MLXArray? = nil, duration: MLXArray? = nil) -> MLXArray {
         var c = timeEmbedder(timesteps)
+        if let durationEmbedder, let duration { c = c + durationEmbedder(duration) }
         if let gCond { c = c + gCond }
         var h = inputLayer(x)
         for blk in blocks { h = blk(h, c, mask) }

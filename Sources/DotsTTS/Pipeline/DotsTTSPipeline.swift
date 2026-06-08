@@ -74,6 +74,9 @@ public final class DotsTTSPipeline: @unchecked Sendable {
     let special: DotsSpecialTokens
     /// Opt-in per-stage profiler (env DOTS_PROFILE_STAGES=1); nil = no extra syncs.
     let profiler: StageProfiler?
+    /// True when the DiT is a MeanFlow-distilled checkpoint (dit/config.json
+    /// `mode == "meanflow"`): few-step, no CFG, duration-conditioned solve.
+    let meanflow: Bool
 
     /// Debug-only: when set, decodeNextPatch uses these injected noises (indexed
     /// by decode step) instead of MLXRandom.normal, and each solved patch latent
@@ -130,11 +133,24 @@ public final class DotsTTSPipeline: @unchecked Sendable {
         try WeightLoading.load(bb, from: backboneDir)
         self.backbone = bb
 
+        // Read dit/config.json `mode`: "meanflow" selects the distilled few-step
+        // solver and a DiT carrying the extra duration_embedder weights.
+        func modeOf(_ dir: URL) -> String {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("config.json")),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let mode = obj["mode"] as? String else { return "flow_matching" }
+            return mode
+        }
+
         let ditDir = modelRepo.appendingPathComponent("dit")
+        let isMeanflow = modeOf(ditDir) == "meanflow"
+        self.meanflow = isMeanflow
         // DiT nests Linears inside [UnaryLayer] arrays (adaLN_modulation,
         // time_embedder.mlp) that quantize(model:) cannot reach, so build them
         // quantised at construction via the factory instead.
-        let dit = DiT(quant: quantOf(ditDir))
+        var ditCfg = DiT.Config()
+        ditCfg.meanflow = isMeanflow
+        let dit = DiT(ditCfg, quant: quantOf(ditDir))
         try WeightLoading.load(dit, from: ditDir)
         self.dit = dit
         self.solver = EulerSolver(dit: dit)
@@ -345,6 +361,11 @@ public final class DotsTTSPipeline: @unchecked Sendable {
             noise = inj[min(debugCapturedZ.count, inj.count - 1)]
         } else {
             noise = MLXRandom.normal([1, patchSize, latentDim])
+        }
+        if meanflow {
+            // Few-step, no CFG; p.numSteps is the NFE (published default 4).
+            return solver.solveMeanFlow(noise: noise, inputSeq: inputSeq, gCond: gCond,
+                                        nfe: p.numSteps, mask: mask)
         }
         return solver.solve(noise: noise, inputSeq: inputSeq, cfgSeq: cfgSeq, gCond: gCond,
                             numSteps: p.numSteps, guidance: p.guidance, mask: mask)

@@ -77,4 +77,30 @@ public final class EulerSolver: Module {
         }
         return z
     }
+
+    /// MeanFlow (few-step distilled) integrator. The student predicts the average
+    /// velocity over the interval, so there is no CFG (no cond/uncond branch) and
+    /// the DiT takes the step interval `dt` as a second time input. Schedule is
+    /// linspace(0, 1, nfe+1); for uniform steps t = k/nfe and dt = 1/nfe, with
+    /// z += v * dt. Single batch (the prompt's conditional sequence only).
+    /// Mirrors core.py `_meanflow_step_fm` / `meanflow_solver_step`.
+    public func solveMeanFlow(
+        noise: MLXArray, inputSeq: MLXArray, gCond: MLXArray, nfe: Int = 4, mask: MLXArray? = nil
+    ) -> MLXArray {
+        let L = inputSeq.dim(1)
+        let latentStart = L - patchSize
+        var z = noise
+        let inv = 1.0 / Float(nfe)
+        for k in 0 ..< nfe {
+            let t = MLXArray(Float(k) * inv).reshaped(1)
+            let dt = MLXArray(inv).reshaped(1)
+            let zc = coordinateProj(z)  // (1, patchSize, hidden)
+            let seq = concatenated([inputSeq[0..., 0 ..< latentStart], zc], axis: 1)  // (1, L, hidden)
+            var vt = dit(seq, timesteps: t, gCond: gCond, mask: mask, duration: dt)
+            vt = vt[0..., latentStart...]  // (1, patchSize, latentDim)
+            z = z + vt * inv
+            eval(z)
+        }
+        return z
+    }
 }

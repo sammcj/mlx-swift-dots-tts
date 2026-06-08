@@ -48,6 +48,10 @@ final class EndToEndTests: XCTestCase {
         var params = DotsTTSPipeline.Params()
         params.seed = UInt64(env["DOTS_SEED"].flatMap { UInt64($0) } ?? 1)
         params.maxOutputPatches = env["DOTS_MAX_PATCHES"].flatMap { Int($0) } ?? 200
+        // For MeanFlow models this is the NFE (published default 4); for
+        // flow-matching it's the Euler step count.
+        if let n = env["DOTS_NUM_STEPS"].flatMap({ Int($0) }) { params.numSteps = n }
+        if let g = env["DOTS_GUIDANCE"].flatMap({ Float($0) }) { params.guidance = g }
 
         // Bound MLX's buffer-recycle cache so this multi-chunk test can't hoard
         // freed buffers up to physical RAM (the host app sets this via its own
