@@ -1,5 +1,6 @@
 SHELL := /bin/bash
-DEBUG_DIR := .build/arm64-apple-macosx/debug
+# Asked of SwiftPM rather than hardcoded: the path moved between toolchains.
+DEBUG_DIR := $(shell swift build --show-bin-path)
 
 # mlx-swift ships its Metal kernels as a resource compiled by xcodebuild's Metal
 # toolchain; `swift build` does NOT build them, so MLX ops crash under `swift

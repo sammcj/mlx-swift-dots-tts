@@ -10,13 +10,13 @@ let package = Package(
         .library(name: "DotsTTS", targets: ["DotsTTS"]),
     ],
     dependencies: [
-        // mlx-swift 0.31.x (matches Cloney's pin). upToNextMinor keeps the
-        // resolution inside 0.31.x: the Makefile's metallib workaround and the
-        // bundled Metal kernels require this minor, so a drift to 0.32+ can
+        // mlx-swift 0.33.x (matches Cloney's pin). upToNextMinor keeps the
+        // resolution inside 0.33.x: the Makefile's metallib workaround and the
+        // bundled Metal kernels require this minor, so a drift to 0.34+ can
         // produce runtime kernel mismatches, not just compile errors.
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMinor(from: "0.31.4")),
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMinor(from: "0.33.0")),
         // swift-transformers for the Qwen2 BPE tokenizer + Hub download helpers.
-        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.3"),
+        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.4.0"),
     ],
     targets: [
         .target(
